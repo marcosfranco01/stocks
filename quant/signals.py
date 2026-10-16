@@ -39,9 +39,34 @@ def price_trend(closes: pd.DataFrame, days: int = TREND_DAYS) -> pd.DataFrame:
     return ret_n / expected
 
 
+def _to_trading_day(dates: pd.Series, index: pd.DatetimeIndex) -> pd.Series:
+    """Map each date to the last trading day on or before it (e.g. Saturday snapshots -> Friday close)."""
+    pos = index.searchsorted(pd.to_datetime(dates), side="right") - 1
+    return pd.Series(index[pos.clip(0)], index=dates.index).where(pos >= 0)
+
+
 def _wide(long: pd.DataFrame, col: str, index: pd.DatetimeIndex) -> pd.DataFrame:
-    w = long.pivot_table(index="date", columns="symbol", values=col)
+    df = long.assign(date=_to_trading_day(long["date"], index)).dropna(subset=["date"])
+    w = df.pivot_table(index="date", columns="symbol", values=col, aggfunc="last")
     return w.reindex(index)
+
+
+def _sampled_change(w: pd.DataFrame, max_gap: int, hold: int) -> pd.DataFrame:
+    """Change between consecutive observations of a sparsely sampled series, per symbol.
+
+    Only counts pairs no more than `max_gap` trading days apart; the change is known on the later
+    observation date and carried forward `hold` days (it is stale after that).
+    """
+    out = pd.DataFrame(index=w.index, columns=w.columns, dtype=float)
+    pos = pd.Series(range(len(w.index)), index=w.index)
+    for sym in w.columns:
+        s = w[sym].dropna()
+        if len(s) < 2:
+            continue
+        gap = pos[s.index].diff()
+        chg = s.diff().where(gap <= max_gap)
+        out[sym] = chg.reindex(w.index)
+    return out.ffill(limit=hold)
 
 
 def build_features(closes: pd.DataFrame, vol: pd.DataFrame, skew: pd.DataFrame | None = None) -> dict[str, pd.DataFrame]:
@@ -49,17 +74,21 @@ def build_features(closes: pd.DataFrame, vol: pd.DataFrame, skew: pd.DataFrame |
     idx = closes.index
     trend = price_trend(closes)
 
-    iv = _wide(vol, "iv_current", idx).ffill(limit=3)
+    # IV is daily from 2025 but sparser before (weekly in 2019): use change between observations
+    # at least CHANGE_DAYS apart where possible, via log-IV differences on the observation grid.
+    iv_raw = _wide(vol, "iv_current", idx)
+    iv = iv_raw.ffill(limit=CHANGE_DAYS)
     iv_chg = np.log(iv / iv.shift(CHANGE_DAYS))
+    # Where daily-ish data is missing, fall back to change between consecutive observations.
+    iv_chg = iv_chg.fillna(_sampled_change(np.log(iv_raw), max_gap=10, hold=CHANGE_DAYS))
 
     feats = {"price_trend": trend, "iv": iv, "iv_change": iv_chg}
 
     if skew is not None and not skew.empty:
-        sk = _wide(skew, "skew_25d", idx)
-        # Skew may be sampled every few days: carry forward up to one sample gap, then difference samples.
-        sk = sk.ffill(limit=CHANGE_DAYS)
-        feats["skew"] = sk
-        feats["skew_change"] = sk - sk.shift(CHANGE_DAYS)
+        sk_raw = _wide(skew, "skew_25d", idx)
+        feats["skew"] = sk_raw.ffill(limit=CHANGE_DAYS)
+        # Skew is sampled every ~5 trading days: change between consecutive samples up to ~3 weeks apart.
+        feats["skew_change"] = _sampled_change(sk_raw, max_gap=15, hold=CHANGE_DAYS)
 
     z_iv = _cs_z(iv_chg)
     if "skew_change" in feats:
