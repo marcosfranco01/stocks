@@ -137,10 +137,15 @@ def fetch_skew_day(date: str, symbols: list[str], min_dte: int = 20, max_dte: in
 def update_skew(symbols: list[str], start: str = "2019-01-01", every_n_days: int = 5) -> pd.DataFrame:
     """Backfill skew on a sample of dates (every Nth trading day) - full daily history is ~10h of queries."""
     cached = pd.read_parquet(SKEW_PATH) if SKEW_PATH.exists() else pd.DataFrame()
-    if not cached.empty:
-        start = (cached["date"].max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    dates = available_dates(start)[::every_n_days]
-    print(f"skew: {len(dates)} sampled dates from {start}")
+    # Use the local vol-history calendar when available (the remote calendar query can time out).
+    if VOL_PATH.exists():
+        cal = sorted(pd.read_parquet(VOL_PATH, columns=["date"])["date"].dt.strftime("%Y-%m-%d").unique())
+        cal = [d for d in cal if d >= start]
+    else:
+        cal = available_dates(start)
+    have = set(cached["date"].dt.strftime("%Y-%m-%d")) if not cached.empty else set()
+    dates = [d for d in cal[::every_n_days] if d not in have]
+    print(f"skew: {len(dates)} sampled dates still to fetch from {start}")
     batch = []
     for i, d in enumerate(dates, 1):
         batch.append(fetch_skew_day(d, symbols))
